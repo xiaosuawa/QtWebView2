@@ -31,6 +31,7 @@ from typing_extensions import deprecated
 from qtpy.QtCore import Qt, QTimer, QStandardPaths
 from qtpy.QtWidgets import QWidget
 from qtpy.QtGui import QWindow
+from qtpy.QtWidgets import QVBoxLayout
 from wryview import WebView
 
 from ._bridge import (
@@ -199,6 +200,7 @@ class QtWebViewWidget(QWidget):
         # ── Create webview (deferred to thread for fast startup) ──
         self._webview: Optional[WebView] = None
         self._anchor: Optional[_AnchorWindow] = None
+        self._fs_window: Optional[QWidget] = None
         self._pending_calls: list[tuple[str, tuple, dict]] = []
 
         if not self._lazyload:
@@ -214,6 +216,8 @@ class QtWebViewWidget(QWidget):
                 "Qt xcb ↔ wry Xlib bridge has unresolved issues. "
                 "Linux users can run the app under Wine instead."
             )
+        logger.info("[%s] creating WebView mode=%s platform=%s",
+                    self, "native_child" if self._native_child else "anchor", sys.platform)
         if self._native_child:
             self._start_webview_native()
         else:
@@ -227,8 +231,7 @@ class QtWebViewWidget(QWidget):
         self._container = QWidget.createWindowContainer(view, self)
         layout = self.layout()
         if layout is None:
-            from qtpy.QtWidgets import QVBoxLayout as _Layout
-            layout = _Layout(self)
+            layout = QVBoxLayout(self)
             layout.setContentsMargins(0, 0, 0, 0)
 
         layout.addWidget(self._container)
@@ -272,18 +275,17 @@ class QtWebViewWidget(QWidget):
             if layout and self._container:
                 layout.removeWidget(self._container)
 
-            from qtpy.QtWidgets import QVBoxLayout as _FSLayout
-
-            self._fs_window = QWidget(None, Qt.WindowType.Window)
+            self._fs_window = QWidget(
+                None, Qt.WindowType.FramelessWindowHint
+            )
             self._fs_window.setAutoFillBackground(True)
-            fs_layout = _FSLayout(self._fs_window)
+            fs_layout = QVBoxLayout(self._fs_window)
             fs_layout.setContentsMargins(0, 0, 0, 0)
             fs_layout.addWidget(self._container)
             self._fs_window.showFullScreen()
             self._resize_webview()
         else:
             self._fs_window.hide()
-
             layout = self.layout()
             if layout and self._container:
                 layout.addWidget(self._container)
@@ -295,6 +297,8 @@ class QtWebViewWidget(QWidget):
 
     def _make_webview(self, hwnd: int) -> WebView:
         """Build the kwargs dict and create a WebView."""
+        import time as _time
+        _t0 = _time.perf_counter()
         init_script = _JS_BRIDGE
         if self._fullscreen_handler is not None:
             init_script += _FULLSCREEN_JS
@@ -313,7 +317,7 @@ class QtWebViewWidget(QWidget):
         # Auto-generate cache directory unless incognito
         if self._incognito:
             if self._user_data_folder:
-                logger.warning("user_data_folder is ignored when incognito=True")
+                logger.warning("[%s] user_data_folder is ignored when incognito=True", self)
         else:
             data_dir = self._user_data_folder
             if not data_dir:
@@ -322,7 +326,7 @@ class QtWebViewWidget(QWidget):
                 )
                 if data_dir:
                     data_dir = f"{data_dir}/QtWebView/"
-            logger.debug(f"WebView DataFolder: {data_dir}")
+            logger.debug("[%s] WebView DataFolder: %s", self, data_dir)
             kwargs["data_directory"] = data_dir
         if self._user_agent:
             kwargs["user_agent"] = self._user_agent
@@ -345,12 +349,12 @@ class QtWebViewWidget(QWidget):
                 server = make_server("127.0.0.1", 0, self._wsgi_app, server_class=ThreadedServer)
                 self._wsgi_port = server.server_port
                 threading.Thread(target=server.serve_forever, daemon=True).start()
-                logger.info("WSGI on http://127.0.0.1:%d", self._wsgi_port)
+                logger.info("[%s] WSGI on http://127.0.0.1:%d", self, self._wsgi_port)
             else:
                 scheme = self._wsgi_scheme or "qtwebview"
                 kwargs["custom_protocols"] = {scheme: self._wsgi_handler}
                 self._wsgi_scheme = scheme
-                logger.info("WSGI custom protocol: %s://", scheme)
+                logger.info("[%s] WSGI custom protocol: %s://", self, scheme)
 
         kwargs["ipc_handler"] = self._on_ipc
         kwargs["on_page_load"] = lambda evt, url: self.bridge.page_loaded.emit(evt, url)
@@ -386,9 +390,14 @@ class QtWebViewWidget(QWidget):
 
         QTimer.singleShot(0, self._resize_webview)
 
-        return WebView(hwnd, **kwargs)
+        wv = WebView(hwnd, **kwargs)
+        logger.debug("[%s] WebView created in %.0fms",
+                     self, (_time.perf_counter() - _t0) * 1000)
+        return wv
 
     def _flush_pending(self):
+        if self._pending_calls:
+            logger.debug("[%s] flushing %d pending calls", self, len(self._pending_calls))
         for name, args, kwargs in self._pending_calls:
             getattr(self, name)(*args, **kwargs)
         self._pending_calls.clear()
@@ -423,6 +432,7 @@ class QtWebViewWidget(QWidget):
             if not func_name or not call_id:
                 return
 
+            logger.debug("[%s] JS API call: %s(%s)", self, func_name, params)
             try:
                 res = self.js_api(func_name, *params)
                 if callable(res):
@@ -430,7 +440,7 @@ class QtWebViewWidget(QWidget):
                 else:
                     self._return_to_js(res, call_id)
             except Exception as e:
-                logger.error("JS API '%s' error: %s", func_name, e, exc_info=True)
+                logger.error("[%s] JS API '%s' error: %s", self, func_name, e, exc_info=True)
                 self._return_js_error(repr(e), call_id)
         except (json.JSONDecodeError, KeyError, TypeError):
             self.signals.web_message_received.emit(msg)
@@ -454,6 +464,7 @@ class QtWebViewWidget(QWidget):
             self, method: str, uri: str, headers: list, body: bytes, respond: Callable,
     ):
         """wryview custom protocol → WSGI adapter (async: calls respond when done)."""
+        logger.debug("[%s] WSGI %s %s", self, method, uri)
         from urllib.parse import urlparse
         parsed = urlparse(uri)
 
@@ -494,7 +505,7 @@ class QtWebViewWidget(QWidget):
             try:
                 result = self._wsgi_app(environ, start_response)
             except Exception as e:
-                logger.error("WSGI error: %s", e, exc_info=True)
+                logger.error("[%s] WSGI error: %s", self, e, exc_info=True)
                 respond(500, [], b"Internal Server Error")
                 return
 
@@ -585,16 +596,25 @@ class QtWebViewWidget(QWidget):
         super().showEvent(event)
         if self._lazyload and not self.is_ready:
             QTimer.singleShot(0, self._start_webview)
-        elif self._anchor:
+        if self._fs_window:
+            self._fs_window.show()
+        if self._anchor:
             self._anchor.show()
-        elif self._webview:
+        if self._webview:
             self._webview.set_visible(True)
+        # If fullscreen is active and the user brings up the main window,
+        # raise the fullscreen window so it doesn't get lost behind.
+        if self._fs_window and self._fs_window.isVisible():
+            self._fs_window.raise_()
+            self._fs_window.activateWindow()
 
     def hideEvent(self, event):
         super().hideEvent(event)
+        if self._fs_window:
+            self._fs_window.hide()
         if self._anchor:
             self._anchor.hide()
-        elif self._webview:
+        if self._webview:
             self._webview.set_visible(False)
 
     def resizeEvent(self, event):
@@ -602,6 +622,7 @@ class QtWebViewWidget(QWidget):
         self._resize_webview()
 
     def closeEvent(self, event):
+        logger.debug("[%s] closing", self)
         self._webview = None
         if self._anchor:
             self._anchor.deleteLater()

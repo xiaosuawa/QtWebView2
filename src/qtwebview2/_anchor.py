@@ -14,9 +14,12 @@ See the class docstring for a detailed rationale.
 """
 from __future__ import annotations
 
+import logging
 import sys
 from qtpy.QtCore import Qt, QTimer
 from qtpy.QtWidgets import QWidget
+
+_log = logging.getLogger(__name__)
 
 
 class _AnchorWindow(QWidget):
@@ -90,6 +93,14 @@ class _AnchorWindow(QWidget):
         self._fill_timer.setSingleShot(True)
         self._fill_timer.timeout.connect(self._fill_layered)
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        # When the window is hidden and shown again, the DWM discards the
+        # layered surface.  A WM_SIZE may not fire (the size didn't change),
+        # so we force an immediate update to restore the alpha=1 surface.
+        if sys.platform == "win32":
+            self._fill_layered()
+
     # ── Win32 message handling ──────────────────────────────────────────
 
     def nativeEvent(self, eventType, message):
@@ -111,6 +122,11 @@ class _AnchorWindow(QWidget):
             # Resize gesture ended — stop the timer and paint immediately
             # so the final frame is guaranteed correct.
             self._fill_timer.stop()
+            self._fill_layered()
+        elif msg.message == 0x031E:  # WM_DWMCOMPOSITIONCHANGED
+            # DWM composition state changed (RDP connect/disconnect,
+            # theme toggle, DWM restart).  The layered surface may
+            # have been discarded — repaint immediately.
             self._fill_layered()
 
         return False, 0
